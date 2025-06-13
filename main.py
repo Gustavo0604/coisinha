@@ -46,7 +46,7 @@ class Config:
     EXPERIENCE_BUFFER_SIZE     = 20
     INCREMENTAL_TRAIN_ROUNDS   = 5
     RETRAIN_INTERVAL           = 60  # iterations before sliding‐window retrain
-    FULL_RETRAIN_INTERVAL      = 60  # same as above, alias
+    FULL_RETRAIN_INTERVAL      = 60
     SIGNAL_THRESHOLD           = 0.55
     SAFE_MODE_LOSS_THRESHOLD   = 0.005  # 0.5% drawdown
     SAFE_MODE_COOLDOWN         = 15     # minutes
@@ -54,7 +54,7 @@ class Config:
     MAX_VOLATILITY             = 0.02  # 2% std of returns
     VOLATILITY_SIZE_FACTOR     = 0.5
     PERFORMANCE_WINDOW         = 20
-    PERFORMANCE_THRESHOLD      = 0.55    # 50% win rate
+    PERFORMANCE_THRESHOLD      = 0.5    # 50% win rate
     LOG_FILE                   = "bot.log"
     SLACK_WEBHOOK_URL          = os.getenv("SLACK_WEBHOOK_URL", "")
     WEB_PORT                   = int(os.getenv("PORT", "8000"))
@@ -217,7 +217,6 @@ class AsyncTrader:
                 self.balances[quote] += cost
                 self.position = self.balances[base]
                 logger.info(f"[SIM] SELL {amount:.6f} BTC @ {price:.2f} -> USDT: {self.balances[quote]:.2f}")
-                # include buy_price for labeling
                 return {"side":"sell", "amount":amount, "price":price, "buy_price":self.last_buy_price}
 
         try:
@@ -227,9 +226,6 @@ class AsyncTrader:
         except Exception as e:
             logger.error(f"Order error: {e}")
             return None
-
-    async def close(self):
-        await self.exchange.close()
 
 # -------------------------------------------------------------------------
 # 7a. WEB DASHBOARD HANDLERS
@@ -317,202 +313,190 @@ class Dashboard:
         return self.layout
 
 # -------------------------------------------------------------------------
-# 8. MAIN LOOP with all features
+# 8. MAIN LOOP with all features + resource cleanup
 # -------------------------------------------------------------------------
 async def main_loop():
     exchange = ccxt.binance({"enableRateLimit": True})
     exchange.set_sandbox_mode(True)
-
-    # Initial data & model setup
-    df0 = await safe_fetch_ohlcv(exchange, Config.SYMBOL, Config.TIMEFRAME, Config.LOOKBACK)
-    df0 = preprocess(df0)
-    X0, y0 = prepare_ml_data(df0)
-
-    # Hyperopt and initial XGBoost model
-    best = optimize_hyperparams(X0, y0)
-    xgb_params = {
-        "eta": float(best["eta"]),
-        "max_depth": int(best["md"]),
-        "subsample": float(best["ss"]),
-        "colsample_bytree": float(best["cb"]),
-        "objective": "binary:logistic",
-        "eval_metric": "auc"
-    }
-    xgb_model = xgb.train(xgb_params, xgb.DMatrix(X0, label=y0), num_boost_round=100)
-
-    # Ensemble: SGDClassifier logistic for online learning
-    sgd_model = SGDClassifier(loss="log", max_iter=1000, tol=1e-3, warm_start=True)
-    sgd_model.partial_fit(X0, y0, classes=[0,1])
-
-    # Drift detector
-    drift_detector = ADWIN()
-
-    # Experience & performance
-    buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
-    performance_buffer = deque(maxlen=Config.PERFORMANCE_WINDOW)
-
-    # Trader & state
     trader = AsyncTrader(Config.SIMULATE_MODE, Config.INITIAL_CAPITAL)
-    wins = losses = 0
-    equity = Config.INITIAL_CAPITAL
-    pnl = 0.0
-    itr = 0
-    last_trade_time = datetime.min.replace(tzinfo=timezone.utc)
-    dash = Dashboard()
 
-    async with exchange:
-        async with trader.exchange:
-            with Live(console=console, refresh_per_second=1) as live:
-                while True:
-                    # Fetch & preprocess latest candles
-                    await trader.update_last_price()
-                    df = await safe_fetch_ohlcv(trader.exchange, Config.SYMBOL, Config.TIMEFRAME, 60)
-                    if df is None:
-                        await asyncio.sleep(5)
-                        continue
-                    df = preprocess(df)
+    try:
+        # Initial data & models setup
+        df0 = await safe_fetch_ohlcv(exchange, Config.SYMBOL, Config.TIMEFRAME, Config.LOOKBACK)
+        df0 = preprocess(df0)
+        X0, y0 = prepare_ml_data(df0)
 
-                    # Update web dashboard data
-                    candle_data.clear()
-                    for ts, row in df.iterrows():
-                        candle_data.append({
-                            "timestamp": ts.isoformat(),
-                            "open": row["open"],
-                            "high": row["high"],
-                            "low": row["low"],
-                            "close": row["close"]
-                        })
+        # Hyperopt & XGBoost
+        best = optimize_hyperparams(X0, y0)
+        xgb_params = {
+            "eta": float(best["eta"]),
+            "max_depth": int(best["md"]),
+            "subsample": float(best["ss"]),
+            "colsample_bytree": float(best["cb"]),
+            "objective": "binary:logistic",
+            "eval_metric": "auc"
+        }
+        xgb_model = xgb.train(xgb_params, xgb.DMatrix(X0, label=y0), num_boost_round=100)
 
-                    last = df.iloc[-1]
-                    feats = np.array([[
-                        last["rsi"], last["macd"], last["macd_sig"],
-                        last["bb_high"], last["bb_low"],
-                        last["atr"], last["hl_range"], last["oc_change"]
-                    ]])
+        # SGDClassifier ensemble with correct loss
+        sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, warm_start=True)
+        sgd_model.partial_fit(X0, y0, classes=[0,1])
 
-                    # Ensemble prediction
-                    prob_xgb = xgb_model.predict(xgb.DMatrix(feats))[0]
-                    prob_sgd = sgd_model.predict_proba(feats)[0][1]
-                    avg_prob = (prob_xgb + prob_sgd) / 2.0
+        # Drift detector and buffers
+        drift_detector = ADWIN()
+        buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
+        performance_buffer = deque(maxlen=Config.PERFORMANCE_WINDOW)
 
-                    # Drift detection
-                    drift_detector.update(avg_prob)
-                    if drift_detector.change_detected:
-                        logger.warning("ADWIN drift detected! Triggering full retrain.")
-                        # Fall through to full retrain code below
-                        itr = Config.FULL_RETRAIN_INTERVAL  # force retrain
+        wins = losses = 0
+        equity = Config.INITIAL_CAPITAL
+        pnl = 0.0
+        itr = 0
+        last_trade_time = datetime.min.replace(tzinfo=timezone.utc)
+        dash = Dashboard()
 
-                    # Concept drift via performance window
-                    if len(performance_buffer) == Config.PERFORMANCE_WINDOW:
-                        wins_window = sum(1 for l, p in performance_buffer if l == 1)
-                        avg_pnl_window = sum(p for l, p in performance_buffer) / Config.PERFORMANCE_WINDOW
-                        if (wins_window / Config.PERFORMANCE_WINDOW) < Config.PERFORMANCE_THRESHOLD or avg_pnl_window < 0:
-                            logger.warning("Performance drift detected! Triggering full retrain.")
-                            itr = Config.FULL_RETRAIN_INTERVAL
+        with Live(console=console, refresh_per_second=1) as live:
+            while True:
+                await trader.update_last_price()
+                df = await safe_fetch_ohlcv(trader.exchange, Config.SYMBOL, Config.TIMEFRAME, 60)
+                if df is None:
+                    await asyncio.sleep(5)
+                    continue
+                df = preprocess(df)
 
-                    # Safe Mode / kill-switch
-                    if pnl < -Config.SAFE_MODE_LOSS_THRESHOLD * Config.INITIAL_CAPITAL:
-                        logger.error("PnL exceeded drawdown threshold! Entering safe mode.")
-                        await asyncio.sleep(Config.SAFE_MODE_COOLDOWN * 60)
+                # Update web data
+                candle_data.clear()
+                for ts, row in df.iterrows():
+                    candle_data.append({
+                        "timestamp": ts.isoformat(),
+                        "open": row["open"],
+                        "high": row["high"],
+                        "low": row["low"],
+                        "close": row["close"]
+                    })
+
+                last = df.iloc[-1]
+                feats = np.array([[
+                    last["rsi"], last["macd"], last["macd_sig"],
+                    last["bb_high"], last["bb_low"],
+                    last["atr"], last["hl_range"], last["oc_change"]
+                ]])
+
+                # Ensemble prediction
+                prob_xgb = xgb_model.predict(xgb.DMatrix(feats))[0]
+                prob_sgd = sgd_model.predict_proba(feats)[0][1]
+                avg_prob = (prob_xgb + prob_sgd) / 2.0
+
+                # Drift and performance checks
+                drift_detector.update(avg_prob)
+                if drift_detector.change_detected:
+                    logger.warning("ADWIN drift detected! Triggering full retrain.")
+                    itr = Config.FULL_RETRAIN_INTERVAL
+
+                if len(performance_buffer) == Config.PERFORMANCE_WINDOW:
+                    wins_window = sum(1 for l, p in performance_buffer if l == 1)
+                    avg_pnl_window = sum(p for l, p in performance_buffer) / Config.PERFORMANCE_WINDOW
+                    if (wins_window / Config.PERFORMANCE_WINDOW) < Config.PERFORMANCE_THRESHOLD or avg_pnl_window < 0:
+                        logger.warning("Performance drift detected! Triggering full retrain.")
                         itr = Config.FULL_RETRAIN_INTERVAL
 
-                    # Cooldown enforcement
-                    now_utc = datetime.now(timezone.utc)
-                    if (now_utc - last_trade_time).total_seconds() < Config.COOLDOWN_MINUTES * 60:
-                        sig = 0
-                        order = None
-                    else:
-                        # Threshold logic
-                        if avg_prob > Config.SIGNAL_THRESHOLD:
-                            sig = 1
-                        elif avg_prob < 1 - Config.SIGNAL_THRESHOLD:
-                            sig = -1
-                        else:
-                            sig = 0
+                # Safe mode
+                if pnl < -Config.SAFE_MODE_LOSS_THRESHOLD * Config.INITIAL_CAPITAL:
+                    logger.error("PnL exceeded drawdown threshold! Entering safe mode.")
+                    await asyncio.sleep(Config.SAFE_MODE_COOLDOWN * 60)
+                    itr = Config.FULL_RETRAIN_INTERVAL
 
-                        # Stop-loss based on ATR
-                        order = None
-                        if trader.position > 0:
-                            stop_price = trader.last_buy_price - 2 * last["atr"]
-                            if trader.last_price < stop_price:
-                                order = await trader.place_order("sell", trader.position)
-                                last_trade_time = now_utc
-                                sig = 0
+                # Cooldown
+                now_utc = datetime.now(timezone.utc)
+                can_trade = (now_utc - last_trade_time).total_seconds() >= Config.COOLDOWN_MINUTES * 60
 
-                        # Volatility filter
-                        vola = df["oc_change"].rolling(20).std().iloc[-1]
-                        size = calculate_position_size(equity, trader.last_price,
-                                                       Config.MAX_POSITION_RISK, last["atr"])
-                        if vola and vola > Config.MAX_VOLATILITY:
-                            size *= Config.VOLATILITY_SIZE_FACTOR
+                sig = 0
+                order = None
 
-                        # Execute trade
-                        if sig == 1 and trader.position == 0:
-                            order = await trader.place_order("buy", size)
-                            last_trade_time = now_utc
-                        elif sig == -1 and trader.position > 0:
+                if can_trade:
+                    if avg_prob > Config.SIGNAL_THRESHOLD:
+                        sig = 1
+                    elif avg_prob < 1 - Config.SIGNAL_THRESHOLD:
+                        sig = -1
+
+                    # Stop-loss
+                    if trader.position > 0:
+                        stop_price = trader.last_buy_price - 2 * last["atr"]
+                        if trader.last_price < stop_price:
                             order = await trader.place_order("sell", trader.position)
                             last_trade_time = now_utc
+                            sig = 0
 
-                    # After a SELL, update performance & incremental training
-                    if order and order.get("side") == "sell":
-                        buy_p = order["buy_price"]
-                        sell_p = order["price"]
-                        label = int(sell_p > buy_p)
-                        wins += label
-                        losses += 1 - label
-                        performance_buffer.append((label, sell_p - buy_p))
+                    # Volatility filter
+                    vola = df["oc_change"].rolling(20).std().iloc[-1]
+                    size = calculate_position_size(equity, trader.last_price,
+                                                   Config.MAX_POSITION_RISK, last["atr"])
+                    if vola and vola > Config.MAX_VOLATILITY:
+                        size *= Config.VOLATILITY_SIZE_FACTOR
 
-                        batch_X, batch_y = buffer.add(feats.flatten(), label)
-                        if batch_y is not None:
-                            # Incremental retrain
-                            xgb_model = xgb.train(
-                                xgb_params,
-                                xgb.DMatrix(batch_X, label=batch_y),
-                                num_boost_round=Config.INCREMENTAL_TRAIN_ROUNDS,
-                                xgb_model=xgb_model
-                            )
-                            sgd_model.partial_fit(batch_X, batch_y)
-                            logger.info(f"Incremental train on {len(batch_y)} samples complete.")
+                    if sig == 1 and trader.position == 0:
+                        order = await trader.place_order("buy", size)
+                        last_trade_time = now_utc
+                    elif sig == -1 and trader.position > 0:
+                        order = await trader.place_order("sell", trader.position)
+                        last_trade_time = now_utc
 
-                    # Equity & PnL update
-                    equity = (
-                        trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
-                        if Config.SIMULATE_MODE
-                        else Config.INITIAL_CAPITAL + trader.position * trader.last_price
-                    )
-                    pnl = equity - Config.INITIAL_CAPITAL
+                # Post-sell updates
+                if order and order.get("side") == "sell":
+                    buy_p = order["buy_price"]
+                    sell_p = order["price"]
+                    label = int(sell_p > buy_p)
+                    wins += label
+                    losses += 1 - label
+                    performance_buffer.append((label, sell_p - buy_p))
+                    batch_X, batch_y = buffer.add(feats.flatten(), label)
+                    if batch_y is not None:
+                        xgb_model = xgb.train(
+                            xgb_params,
+                            xgb.DMatrix(batch_X, label=batch_y),
+                            num_boost_round=Config.INCREMENTAL_TRAIN_ROUNDS,
+                            xgb_model=xgb_model
+                        )
+                        sgd_model.partial_fit(batch_X, batch_y)
+                        logger.info(f"Incremental train on {len(batch_y)} samples complete.")
 
-                    # Sliding-window full retrain
-                    itr += 1
-                    if itr % Config.FULL_RETRAIN_INTERVAL == 0:
-                        logger.info("Full retrain on sliding window...")
-                        df_full = await safe_fetch_ohlcv(exchange, Config.SYMBOL,
-                                                         Config.TIMEFRAME, Config.LOOKBACK)
-                        df_full = preprocess(df_full)
-                        X_full, y_full = prepare_ml_data(df_full)
+                # Equity & PnL
+                equity = (
+                    trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
+                    if Config.SIMULATE_MODE
+                    else Config.INITIAL_CAPITAL + trader.position * trader.last_price
+                )
+                pnl = equity - Config.INITIAL_CAPITAL
 
-                        # Retrain XGBoost from scratch
-                        xgb_model = xgb.train(xgb_params,
-                                              xgb.DMatrix(X_full, label=y_full),
-                                              num_boost_round=100)
+                # Sliding-window full retrain
+                itr += 1
+                if itr % Config.FULL_RETRAIN_INTERVAL == 0:
+                    logger.info("Full retrain on sliding window...")
+                    df_full = await safe_fetch_ohlcv(exchange, Config.SYMBOL,
+                                                     Config.TIMEFRAME, Config.LOOKBACK)
+                    df_full = preprocess(df_full)
+                    X_full, y_full = prepare_ml_data(df_full)
 
-                        # Retrain SGDClassifier
-                        sgd_model = SGDClassifier(loss="log", max_iter=1000, tol=1e-3, warm_start=True)
-                        sgd_model.partial_fit(X_full, y_full, classes=[0,1])
+                    xgb_model = xgb.train(xgb_params,
+                                          xgb.DMatrix(X_full, label=y_full),
+                                          num_boost_round=100)
+                    sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, warm_start=True)
+                    sgd_model.partial_fit(X_full, y_full, classes=[0,1])
 
-                        # Reset buffers/statistics
-                        buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
-                        performance_buffer.clear()
-                        drift_detector.reset()
-                        wins = losses = 0
-                        send_slack_alert("Full retrain complete.")
-                        logger.info("Full retrain complete.")
+                    buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
+                    performance_buffer.clear()
+                    drift_detector.reset()
+                    wins = losses = 0
+                    send_slack_alert("Full retrain complete.")
+                    logger.info("Full retrain complete.")
 
-                    # Update terminal dashboard
-                    live.update(dash.render(equity, pnl, wins, losses, int(trader.position > 0)))
+                live.update(dash.render(equity, pnl, wins, losses, int(trader.position > 0)))
+                await asyncio.sleep(60)
 
-                    await asyncio.sleep(60)
+    finally:
+        # Ensure all exchanges are closed
+        await trader.exchange.close()
+        await exchange.close()
+        logger.info("Exchanges fechados com sucesso.")
 
 # -------------------------------------------------------------------------
 # 9. RUN BOTH BOT AND WEB DASHBOARD
