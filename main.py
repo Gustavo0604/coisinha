@@ -333,7 +333,8 @@ async def main_loop():
         }
         xgb_model = xgb.train(xgb_params, xgb.DMatrix(X0, label=y0), num_boost_round=100)
 
-        sgd_model = SGDClassifier(loss="log", max_iter=1000, tol=1e-3, warm_start=True)
+        # Usando log_loss para compatibilidade
+        sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, warm_start=True)
         sgd_model.partial_fit(X0, y0, classes=[0,1])
 
         drift_detector = ADWIN()
@@ -359,10 +360,10 @@ async def main_loop():
                 for ts, row in df.iterrows():
                     candle_data.append({
                         "timestamp": ts.isoformat(),
-                        "open": row["open"],
-                        "high": row["high"],
-                        "low": row["low"],
-                        "close": row["close"]
+                        "open":   row["open"],
+                        "high":   row["high"],
+                        "low":    row["low"],
+                        "close":  row["close"]
                     })
 
                 last = df.iloc[-1]
@@ -466,7 +467,7 @@ async def main_loop():
                     xgb_model = xgb.train(xgb_params,
                                           xgb.DMatrix(X_full, label=y_full),
                                           num_boost_round=100)
-                    sgd_model = SGDClassifier(loss="log", max_iter=1000, tol=1e-3, warm_start=True)
+                    sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, warm_start=True)
                     sgd_model.partial_fit(X_full, y_full, classes=[0,1])
 
                     buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
