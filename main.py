@@ -374,9 +374,9 @@ async def main_loop():
                 prob_sgd = sgd_model.predict_proba(feats)[0][1]
                 avg_prob = (prob_xgb + prob_sgd) / 2.0
 
-                # Drift detection
-                drift_detector.update(avg_prob)
-                if drift_detector.change_detected:
+                # Detecção de drift via ADWIN
+                detected = drift_detector.update(avg_prob)
+                if detected:
                     logger.warning("ADWIN drift detected! Triggering full retrain.")
                     itr = Config.FULL_RETRAIN_INTERVAL
 
@@ -430,7 +430,7 @@ async def main_loop():
                         order = await trader.place_order("sell", trader.position)
                         last_trade_time = now
 
-                # After SELL
+                # Pós-venda
                 if order and order.get("side") == "sell":
                     buy_p = order["buy_price"]
                     sell_p = order["price"]
@@ -455,7 +455,7 @@ async def main_loop():
                           else Config.INITIAL_CAPITAL + trader.position * trader.last_price)
                 pnl = equity - Config.INITIAL_CAPITAL
 
-                # Sliding-window full retrain
+                # Re-treinamento completo em janela deslizante
                 itr += 1
                 if itr % Config.FULL_RETRAIN_INTERVAL == 0:
                     logger.info("Full retrain on sliding window...")
@@ -472,7 +472,7 @@ async def main_loop():
 
                     buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
                     performance_buffer.clear()
-                    drift_detector.reset()
+                    drift_detector = ADWIN()
                     wins = losses = 0
                     send_slack_alert("Full retrain complete.")
                     logger.info("Full retrain complete.")
@@ -480,7 +480,7 @@ async def main_loop():
                 # Update dashboard
                 live.update(dash.render(equity, pnl, wins, losses, int(trader.position > 0)))
 
-                # Simplified logging for non-TTY
+                # Logging simplificado para não-TTY
                 if not sys.stdout.isatty():
                     logger.info(
                         f"[Loop {itr}] Equity=${equity:,.2f}  PnL=${pnl:,.2f}  "
