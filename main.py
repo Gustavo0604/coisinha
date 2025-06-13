@@ -20,7 +20,6 @@ from collections import deque
 from hyperopt import hp, fmin, tpe, Trials, STATUS_OK
 import xgboost as xgb
 from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import accuracy_score
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel
@@ -45,7 +44,7 @@ class Config:
     MAX_POSITION_RISK          = 0.02
     EXPERIENCE_BUFFER_SIZE     = 20
     INCREMENTAL_TRAIN_ROUNDS   = 5
-    RETRAIN_INTERVAL           = 60  # iterations before sliding‐window retrain
+    RETRAIN_INTERVAL           = 60
     FULL_RETRAIN_INTERVAL      = 60
     SIGNAL_THRESHOLD           = 0.55
     SAFE_MODE_LOSS_THRESHOLD   = 0.005  # 0.5% drawdown
@@ -244,21 +243,21 @@ async def dashboard_handler(request):
 async function load() {
   const resp = await fetch('/data'); const json = await resp.json();
   const candles = json.candles.map(c=>({x:new Date(c.timestamp),o:c.open,h:c.high,l:c.low,c:c.close}));
-  const buys = json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  const sells= json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
+  const buys = json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y	t.price}));
+  const sells= json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y	t.price}));
   window.ch = new Chart(document.getElementById('chart').getContext('2d'),{
     type:'candlestick',data:{datasets:[
-      {label:'Price',data:candles},
-      {label:'Buys',type:'scatter',data:buys,backgroundColor:'green'},
-      {label:'Sells',type:'scatter',data:sells,backgroundColor:'red'}
+      {label:'Price',data	candles},
+      {label:'Buys',type:'scatter',data	buys,backgroundColor:'green'},
+      {label:'Sells',type:'scatter',data	sells,backgroundColor:'red'}
     ]},options:{scales:{x:{type:'time'}}}
   });
 }
 async function refresh(){
   const resp=await fetch('/data'), json=await resp.json();
-  window.ch.data.datasets[0].data=json.candles.map(c=>({x:new Date(c.timestamp),o:c.open,h:c.high,l:c.low,c:c.close}));
-  window.ch.data.datasets[1].data=json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  window.ch.data.datasets[2].data=json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
+  window.ch.data.datasets[0].data=json.candles.map(c=>({x:new Date(c.timestamp),o	c.open,h	c.high,l	c.low,c	c.close}));
+  window.ch.data.datasets[1].data=json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y	t.price}));
+  window.ch.data.datasets[2].data=json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y	t.price}));
   window.ch.update();
 }
 load(); setInterval(refresh,5000);
@@ -386,12 +385,12 @@ async def main_loop():
                 prob_sgd = sgd_model.predict_proba(feats)[0][1]
                 avg_prob = (prob_xgb + prob_sgd) / 2.0
 
-                # Drift and performance checks
-                drift_detector.update(avg_prob)
-                if drift_detector.change_detected:
+                # Drift detection via ADWIN.update()
+                if drift_detector.update(avg_prob):
                     logger.warning("ADWIN drift detected! Triggering full retrain.")
                     itr = Config.FULL_RETRAIN_INTERVAL
 
+                # Performance drift
                 if len(performance_buffer) == Config.PERFORMANCE_WINDOW:
                     wins_window = sum(1 for l, p in performance_buffer if l == 1)
                     avg_pnl_window = sum(p for l, p in performance_buffer) / Config.PERFORMANCE_WINDOW
@@ -484,7 +483,7 @@ async def main_loop():
 
                     buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
                     performance_buffer.clear()
-                    drift_detector.reset()
+                    drift_detector = ADWIN()  # reset drift detector
                     wins = losses = 0
                     send_slack_alert("Full retrain complete.")
                     logger.info("Full retrain complete.")
@@ -493,7 +492,7 @@ async def main_loop():
                 await asyncio.sleep(60)
 
     finally:
-        # Ensure all exchanges are closed
+        # Ensure exchanges are closed
         await trader.exchange.close()
         await exchange.close()
         logger.info("Exchanges fechados com sucesso.")
