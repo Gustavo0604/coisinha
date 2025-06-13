@@ -4,7 +4,7 @@
 Advanced Crypto Trading Bot with Incremental Learning, Experience Buffer,
 Trade Accuracy Scoring, Risk Management, Simulation Mode, Detailed Logging,
 Alerts, Terminal Dashboard (Rich), Web Dashboard, Drift Detection,
-Safe Mode, Ensemble, Volatility Filter, Cooldown, Sliding‑Window Retrain.
+Safe Mode, Ensemble, Volatility Filter, Cooldown, Sliding-Window Retrain.
 """
 
 import os
@@ -36,28 +36,26 @@ from river.drift import ADWIN
 # 1. CONFIGURAÇÕES & UTILITÁRIOS
 # -------------------------------------------------------------------------
 class Config:
-    SYMBOL                     = "BTC/USDT"
-    TIMEFRAME                  = "1m"
-    LOOKBACK                   = 1000
-    SIMULATE_MODE              = True
-    INITIAL_CAPITAL            = 450.0
-    MAX_POSITION_RISK          = 0.02
-    EXPERIENCE_BUFFER_SIZE     = 20
-    INCREMENTAL_TRAIN_ROUNDS   = 5
-    RETRAIN_INTERVAL           = 60
-    FULL_RETRAIN_INTERVAL      = 60
-    SIGNAL_THRESHOLD           = 0.55
-    SAFE_MODE_LOSS_THRESHOLD   = 0.005  # 0.5% drawdown
-    SAFE_MODE_COOLDOWN         = 15     # minutes
-    COOLDOWN_MINUTES           = 3
-    MAX_VOLATILITY             = 0.02  # 2% std of returns
-    VOLATILITY_SIZE_FACTOR     = 0.5
-    PERFORMANCE_WINDOW         = 20
-    PERFORMANCE_THRESHOLD      = 0.5    # 50% win rate
-    LOG_FILE                   = "bot.log"
-    SLACK_WEBHOOK_URL          = os.getenv("SLACK_WEBHOOK_URL", "")
-    WEB_PORT                   = int(os.getenv("PORT", "8000"))
-
+    SYMBOL                   = "BTC/USDT"
+    TIMEFRAME                = "1m"
+    LOOKBACK                 = 1000
+    SIMULATE_MODE            = True
+    INITIAL_CAPITAL          = 450.0
+    MAX_POSITION_RISK        = 0.02
+    EXPERIENCE_BUFFER_SIZE   = 20
+    INCREMENTAL_TRAIN_ROUNDS = 5
+    FULL_RETRAIN_INTERVAL    = 60  # iterations
+    SIGNAL_THRESHOLD         = 0.55
+    SAFE_MODE_LOSS_THRESHOLD = 0.005  # 0.5% drawdown
+    SAFE_MODE_COOLDOWN       = 15     # minutes
+    COOLDOWN_MINUTES         = 3
+    MAX_VOLATILITY           = 0.02   # 2% std of returns
+    VOLATILITY_SIZE_FACTOR   = 0.5
+    PERFORMANCE_WINDOW       = 20
+    PERFORMANCE_THRESHOLD    = 0.5    # 50% win rate
+    LOG_FILE                 = "bot.log"
+    SLACK_WEBHOOK_URL        = os.getenv("SLACK_WEBHOOK_URL", "")
+    WEB_PORT                 = int(os.getenv("PORT", "8000"))
 
 def setup_logging():
     logger = logging.getLogger("AdvancedBot")
@@ -117,7 +115,6 @@ async def safe_fetch_ohlcv(exchange, symbol, timeframe, limit):
         logger.warning(f"fetch_ohlcv failed: {e}")
         return None
 
-
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
@@ -132,7 +129,6 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df["oc_change"] = (df["close"] - df["open"]) / df["open"]
     df.dropna(inplace=True)
     return df
-
 
 def prepare_ml_data(df: pd.DataFrame):
     df = df.copy()
@@ -151,7 +147,6 @@ def hyperopt_objective(params):
     cv = xgb.cv(params, dtrain, num_boost_round=50, nfold=3,
                 metrics={"auc"}, as_pandas=True, seed=42)
     return {"loss": -cv["test-auc-mean"].iloc[-1], "status": STATUS_OK}
-
 
 def optimize_hyperparams(X, y):
     space = {
@@ -214,13 +209,13 @@ class AsyncTrader:
                 self.position = self.balances[base]
                 self.last_buy_price = price
                 logger.info(f"[SIM] BUY  {amount:.6f} BTC @ {price:.2f} -> USDT: {self.balances[quote]:.2f}")
-                return {"side":"buy", "amount":amount, "price":price}
+                return {"side":"buy","amount":amount,"price":price}
             else:
                 self.balances[base]  -= amount
                 self.balances[quote] += cost
                 self.position = self.balances[base]
                 logger.info(f"[SIM] SELL {amount:.6f} BTC @ {price:.2f} -> USDT: {self.balances[quote]:.2f}")
-                return {"side":"sell", "amount":amount, "price":price, "buy_price":self.last_buy_price}
+                return {"side":"sell","amount":amount,"price":price,"buy_price":self.last_buy_price}
 
         try:
             o = await self.exchange.create_order(Config.SYMBOL, "market", side, amount)
@@ -247,21 +242,21 @@ async def dashboard_handler(request):
 async function load() {
   const resp = await fetch('/data'); const json = await resp.json();
   const candles = json.candles.map(c=>({x:new Date(c.timestamp),o:c.open,h:c.high,l:c.low,c:c.close}));
-  const buys = json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  const sells= json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
+  const buys   = json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
+  const sells  = json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
   window.ch = new Chart(document.getElementById('chart').getContext('2d'),{
-    type:'candlestick',data:{datasets":[
+    type:'candlestick',data:{datasets:[
       {label:'Price',data:candles},
-      {label:'Buys',type:'scatter',data:buys,backgroundColor:'green'},
-      {label:'Sells',type:'scatter',data:sells,backgroundColor:'red'}
+      {label:'Buys', type:'scatter', data:buys,  backgroundColor:'green'},
+      {label:'Sells',type:'scatter', data:sells, backgroundColor:'red'}
     ]},options:{scales:{x:{type:'time'}}}
   });
 }
 async function refresh(){
-  const resp=await fetch('/data'), json=await resp.json();
-  window.ch.data.datasets[0].data=json.candles.map(c=>({x:new Date(c.timestamp),o:c.open,h:c.high,l:c.low,c:c.close}));
-  window.ch.data.datasets[1].data=json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  window.ch.data.datasets[2].data=json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
+  const resp = await fetch('/data'), json = await resp.json();
+  window.ch.data.datasets[0].data = json.candles.map(c=>({x:new Date(c.timestamp),o:c.open,h:c.high,l:c.low,c:c.close}));
+  window.ch.data.datasets[1].data = json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
+  window.ch.data.datasets[2].data = json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
   window.ch.update();
 }
 load(); setInterval(refresh,5000);
@@ -270,10 +265,7 @@ load(); setInterval(refresh,5000);
 """, content_type="text/html")
 
 async def data_handler(request):
-    return web.json_response({
-        "candles": list(candle_data),
-        "trades": trade_events
-    })
+    return web.json_response({"candles": list(candle_data), "trades": trade_events})
 
 async def start_web_dashboard():
     app = web.Application()
@@ -301,10 +293,10 @@ class Dashboard:
 
     def render(self, equity, pnl, wins, losses, open_pos):
         tbl = Table(expand=True)
-        for k, v in [
+        for k,v in [
             ("Equity", f"${equity:,.2f}"),
-            ("P&L", f"${pnl:,.2f}"),
-            ("Wins", str(wins)),
+            ("P&L",    f"${pnl:,.2f}"),
+            ("Wins",   str(wins)),
             ("Losses", str(losses)),
             ("Open Pos", str(open_pos))
         ]:
@@ -316,12 +308,13 @@ class Dashboard:
         return self.layout
 
 # -------------------------------------------------------------------------
-# 8. MAIN LOOP with all features + resource cleanup
+# 8. MAIN LOOP with all features + proper cleanup
 # -------------------------------------------------------------------------
 async def main_loop():
     exchange = ccxt.binance({"enableRateLimit": True})
     exchange.set_sandbox_mode(True)
     trader = AsyncTrader(Config.SIMULATE_MODE, Config.INITIAL_CAPITAL)
+    last_trade_time = datetime.now(timezone.utc) - timedelta(minutes=Config.COOLDOWN_MINUTES)
 
     try:
         # Initial setup
@@ -340,7 +333,7 @@ async def main_loop():
         }
         xgb_model = xgb.train(xgb_params, xgb.DMatrix(X0, label=y0), num_boost_round=100)
 
-        sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, warm_start=True)
+        sgd_model = SGDClassifier(loss="log", max_iter=1000, tol=1e-3, warm_start=True)
         sgd_model.partial_fit(X0, y0, classes=[0,1])
 
         drift_detector = ADWIN()
@@ -351,7 +344,6 @@ async def main_loop():
         equity = Config.INITIAL_CAPITAL
         pnl = 0.0
         itr = 0
-        last_trade_time = datetime.min.replace(tzinfo=timezone.utc)
         dash = Dashboard()
 
         with Live(console=console, refresh_per_second=1) as live:
@@ -374,34 +366,36 @@ async def main_loop():
                     })
 
                 last = df.iloc[-1]
-                feats = np.array([[
-                    last["rsi"], last["macd"], last["macd_sig"],
-                    last["bb_high"], last["bb_low"],
-                    last["atr"], last["hl_range"], last["oc_change"]
-                ]])
+                feats = last[["rsi","macd","macd_sig","bb_high","bb_low",
+                              "atr","hl_range","oc_change"]].values.reshape(1, -1)
 
                 prob_xgb = xgb_model.predict(xgb.DMatrix(feats))[0]
                 prob_sgd = sgd_model.predict_proba(feats)[0][1]
                 avg_prob = (prob_xgb + prob_sgd) / 2.0
 
-                if drift_detector.update(avg_prob):
+                # Drift detection
+                drift_detector.update(avg_prob)
+                if drift_detector.change_detected:
                     logger.warning("ADWIN drift detected! Triggering full retrain.")
                     itr = Config.FULL_RETRAIN_INTERVAL
 
+                # Performance drift
                 if len(performance_buffer) == Config.PERFORMANCE_WINDOW:
-                    wins_window = sum(1 for l, p in performance_buffer if l == 1)
-                    avg_pnl_window = sum(p for l, p in performance_buffer) / Config.PERFORMANCE_WINDOW
-                    if wins_window / Config.PERFORMANCE_WINDOW < Config.PERFORMANCE_THRESHOLD or avg_pnl_window < 0:
+                    wins_w = sum(1 for l,_ in performance_buffer if l==1)
+                    pnl_w  = sum(p for _,p in performance_buffer) / Config.PERFORMANCE_WINDOW
+                    if wins_w/Config.PERFORMANCE_WINDOW < Config.PERFORMANCE_THRESHOLD or pnl_w < 0:
                         logger.warning("Performance drift detected! Triggering full retrain.")
                         itr = Config.FULL_RETRAIN_INTERVAL
 
+                # Safe-mode kill-switch
                 if pnl < -Config.SAFE_MODE_LOSS_THRESHOLD * Config.INITIAL_CAPITAL:
                     logger.error("PnL exceeded drawdown threshold! Entering safe mode.")
                     await asyncio.sleep(Config.SAFE_MODE_COOLDOWN * 60)
                     itr = Config.FULL_RETRAIN_INTERVAL
 
-                now_utc = datetime.now(timezone.utc)
-                can_trade = (now_utc - last_trade_time).total_seconds() >= Config.COOLDOWN_MINUTES * 60
+                # Cooldown
+                now = datetime.now(timezone.utc)
+                can_trade = (now - last_trade_time).total_seconds() >= Config.COOLDOWN_MINUTES * 60
 
                 sig = 0
                 order = None
@@ -412,26 +406,30 @@ async def main_loop():
                     elif avg_prob < 1 - Config.SIGNAL_THRESHOLD:
                         sig = -1
 
+                    # Stop-loss ATR
                     if trader.position > 0:
                         stop_price = trader.last_buy_price - 2 * last["atr"]
                         if trader.last_price < stop_price:
                             order = await trader.place_order("sell", trader.position)
-                            last_trade_time = now_utc
+                            last_trade_time = now
                             sig = 0
 
+                    # Volatility filter
                     vola = df["oc_change"].rolling(20).std().iloc[-1]
                     size = calculate_position_size(equity, trader.last_price,
                                                    Config.MAX_POSITION_RISK, last["atr"])
                     if vola and vola > Config.MAX_VOLATILITY:
                         size *= Config.VOLATILITY_SIZE_FACTOR
 
+                    # Execute signal
                     if sig == 1 and trader.position == 0:
                         order = await trader.place_order("buy", size)
-                        last_trade_time = now_utc
+                        last_trade_time = now
                     elif sig == -1 and trader.position > 0:
                         order = await trader.place_order("sell", trader.position)
-                        last_trade_time = now_utc
+                        last_trade_time = now
 
+                # After SELL
                 if order and order.get("side") == "sell":
                     buy_p = order["buy_price"]
                     sell_p = order["price"]
@@ -450,13 +448,13 @@ async def main_loop():
                         sgd_model.partial_fit(batch_X, batch_y)
                         logger.info(f"Incremental train on {len(batch_y)} samples complete.")
 
-                equity = (
-                    trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
-                    if Config.SIMULATE_MODE
-                    else Config.INITIAL_CAPITAL + trader.position * trader.last_price
-                )
+                # Equity & PnL
+                equity = (trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
+                          if Config.SIMULATE_MODE
+                          else Config.INITIAL_CAPITAL + trader.position * trader.last_price)
                 pnl = equity - Config.INITIAL_CAPITAL
 
+                # Sliding-window full retrain
                 itr += 1
                 if itr % Config.FULL_RETRAIN_INTERVAL == 0:
                     logger.info("Full retrain on sliding window...")
@@ -468,24 +466,24 @@ async def main_loop():
                     xgb_model = xgb.train(xgb_params,
                                           xgb.DMatrix(X_full, label=y_full),
                                           num_boost_round=100)
-                    sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, warm_start=True)
+                    sgd_model = SGDClassifier(loss="log", max_iter=1000, tol=1e-3, warm_start=True)
                     sgd_model.partial_fit(X_full, y_full, classes=[0,1])
 
                     buffer = ExperienceBuffer(Config.EXPERIENCE_BUFFER_SIZE)
                     performance_buffer.clear()
-                    drift_detector = ADWIN()
+                    drift_detector.reset()
                     wins = losses = 0
                     send_slack_alert("Full retrain complete.")
                     logger.info("Full retrain complete.")
 
-                # 更新 Rich dashboard
+                # Update dashboard
                 live.update(dash.render(equity, pnl, wins, losses, int(trader.position > 0)))
 
-                # Log simplificado para ambiente não-TTY (Railway, Docker logs)
+                # Simplified logging for non-TTY
                 if not sys.stdout.isatty():
                     logger.info(
                         f"[Loop {itr}] Equity=${equity:,.2f}  PnL=${pnl:,.2f}  "
-                        f"Wins={wins}  Losses={losses}  OpenPos={int(trader.position>0)}"
+                        f"Wins={wins} Losses={losses} OpenPos={int(trader.position>0)}"
                     )
 
                 await asyncio.sleep(60)
@@ -493,7 +491,7 @@ async def main_loop():
     finally:
         await trader.exchange.close()
         await exchange.close()
-        logger.info("Exchanges fechados com sucesso.")
+        logger.info("Exchanges closed successfully.")
 
 # -------------------------------------------------------------------------
 # 9. RUN BOTH BOT AND WEB DASHBOARD
