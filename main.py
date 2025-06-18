@@ -1,22 +1,8 @@
-```python
 #!/usr/bin/env python3
-"""
-Async Live Scalping Bot — Paper Trading com Fetch a Cada 1m (Sandbox/Testnet)
-
-Este script une o sistema de fetch do AdvancedBot com uma estratégia
- de micro-trades scalping (stop gain de +0,10 USD, stop loss de –0,12 USD)
- e simula em tempo real (paper trading) sobre uma banca fictícia,
- usando o sandbox (testnet) da Binance para evitar bloqueios por localização.
-
-Para usar com o sandbox da Binance, certifique-se de ter uma conta de teste
- em https://testnet.binance.vision e as credenciais (API key/Secret) configuradas
- nas variáveis de ambiente BINANCE_APIKEY_TEST e BINANCE_SECRET_TEST.
-"""
-
+import os
 import asyncio
 import logging
 from datetime import datetime, timezone
-import os
 import pandas as pd
 import ccxt.async_support as ccxt
 
@@ -25,18 +11,12 @@ import ccxt.async_support as ccxt
 # ------------------------
 SYMBOL          = "BTC/USDT"
 TIMEFRAME       = "1m"
-FETCH_LIMIT     = 200     # quantos candles pegar a cada iteração
-LOOKBACK_CANDLES= 50      # mínimo de candles para indicadores
+FETCH_LIMIT     = 200     # quantos candles buscar a cada iteração
 INITIAL_BALANCE = 450.0   # USDT
 PROFIT_TARGET   = 0.10    # USD de ganho por trade
 STOP_LOSS       = 0.12    # USD de perda por trade
 MAX_RETRIES     = 5       # tentativas em caso de timeout
 RETRY_DELAY     = 2       # segundos entre tentativas
-# ------------------------
-
-# API TESTNET CREDENTIALS (opcional)
-TESTNET_API_KEY    = os.getenv('BINANCE_APIKEY_TEST', '')
-TESTNET_API_SECRET = os.getenv('BINANCE_SECRET_TEST', '')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,8 +25,7 @@ logging.basicConfig(
 
 async def safe_fetch_ohlcv(exchange, symbol, timeframe, limit):
     """
-    Busca OHLCV com retry.
-    Retorna DataFrame ou None em caso de falha.
+    Busca OHLCV com retry. Retorna DataFrame ou None em caso de falha.
     """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -92,7 +71,7 @@ def detect_trend(df: pd.DataFrame, idx: int) -> str:
     ema50 = df["ema50"].iat[idx]
     if ema20 > ema50:
         return "up"
-    elif ema20 < ema50:
+    if ema20 < ema50:
         return "down"
     return "side"
 
@@ -106,7 +85,7 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     resistance = df["high"].rolling(50).max()
     vol20      = df["volume"].rolling(20).mean()
 
-    for i in range(LOOKBACK_CANDLES, len(df)-1):
+    for i in range(200, len(df)-1):
         price = df["close"].iat[i]
         rsi   = df["rsi14"].iat[i]
         trend = detect_trend(df, i)
@@ -134,45 +113,48 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 async def main():
-    # inicializa exchange em sandbox/testnet
+    # Credenciais de Testnet Binance (setar BINANCE_APIKEY_TEST e BINANCE_SECRET_TEST)
+    api_key = os.getenv("BINANCE_APIKEY_TEST")
+    secret  = os.getenv("BINANCE_SECRET_TEST")
+
     exchange = ccxt.binance({
-        'apiKey': TESTNET_API_KEY,
-        'secret': TESTNET_API_SECRET,
-        'enableRateLimit': True,
+        "apiKey": api_key,
+        "secret": secret,
+        "enableRateLimit": True,
     })
+    # ativa sandbox/testnet
     exchange.set_sandbox_mode(True)
     await exchange.load_markets()
 
-    balance = INITIAL_BALANCE
+    balance  = INITIAL_BALANCE
     position = None  # {"side":"long"/"short", "entry":float}
 
-    logging.info(f"Starting paper trading simulation (testnet) — initial balance {balance:.2f} USDT")
+    logging.info(f"Starting paper trading simulation — initial balance {balance:.2f} USDT")
 
     try:
         while True:
             await wait_until_next_minute()
 
             df = await safe_fetch_ohlcv(exchange, SYMBOL, TIMEFRAME, FETCH_LIMIT)
-            if df is None or len(df) < LOOKBACK_CANDLES:
-                logging.info(f"Waiting for lookback data: {len(df) if df is not None else 0}/{LOOKBACK_CANDLES} candles")
+            if df is None or df.empty:
                 continue
 
             df = compute_indicators(df)
             df = generate_signals(df)
 
-            sig = int(df["signal"].iat[-2])
-            next_open = df["open"].iat[-1]
+            sig       = int(df["signal"].iat[-2])  # sinal do candle fechado
+            next_open = df["open"].iat[-1]         # preço de abertura do próximo
 
             if position is None and sig != 0:
-                side = "long" if sig == 1 else "short"
-                position = {"side": side, "entry": next_open}
+                side      = "long" if sig == 1 else "short"
+                position  = {"side": side, "entry": next_open}
                 logging.info(f"[ENTRY] {side.upper()} @ {next_open:.2f}")
 
             if position:
-                ticker = await exchange.fetch_ticker(SYMBOL)
+                ticker     = await exchange.fetch_ticker(SYMBOL)
                 last_price = float(ticker["last"])
-                side = position["side"]
-                entry = position["entry"]
+                side       = position["side"]
+                entry      = position["entry"]
 
                 if side == "long":
                     if last_price >= entry + PROFIT_TARGET:
@@ -183,7 +165,7 @@ async def main():
                         balance -= STOP_LOSS
                         logging.info(f"[SL] LONG -{STOP_LOSS:.2f} @ {last_price:.2f} → Balance {balance:.2f}")
                         position = None
-                else:
+                else:  # short
                     if last_price <= entry - PROFIT_TARGET:
                         balance += PROFIT_TARGET
                         logging.info(f"[TP] SHORT +{PROFIT_TARGET:.2f} @ {last_price:.2f} → Balance {balance:.2f}")
