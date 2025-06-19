@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Async Live Scalping Bot — Paper Trading com Lookback Mínimo
+Async Live Scalping Bot — Paper Trading com Fallback de Exchange
 
-Simula operações de micro trades em tempo real (paper trading) usando Binance/CCXT,
-com fetch de OHLCV a cada minuto e espera até acumular dados mínimos para rodar indicadores.
+Detecta o erro 451 ao usar binance.com e faz fallback para binance.us
+para contornar restrições de localização.
 
 Requisitos:
     pip install ccxt pandas numpy
@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timezone
 import pandas as pd
 import ccxt.async_support as ccxt
+from ccxt.base.errors import ExchangeNotAvailable
 
 # ------------------------
 # CONFIGURAÇÕES GERAIS
@@ -25,7 +26,7 @@ import ccxt.async_support as ccxt
 SYMBOL          = "BTC/USDT"
 TIMEFRAME       = "1m"
 FETCH_LIMIT     = 300      # quantos candles buscar a cada iteração (>= LOOKBACK)
-LOOKBACK        = 200      # mínimo de candles para começar a operar
+LOOKBACK        = 50       # mínimo de candles para começar a operar
 INITIAL_BALANCE = 450.0    # USDT
 PROFIT_TARGET   = 0.10     # USD de ganho por trade
 STOP_LOSS       = 0.12     # USD de perda por trade
@@ -37,6 +38,22 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
+async def create_exchange():
+    """
+    Tenta criar e carregar mercados em 'binance', senão faz fallback para 'binanceus'.
+    """
+    for cls_name in ('binance', 'binanceus'):
+        exchange_cls = getattr(ccxt, cls_name)
+        exchange = exchange_cls({'enableRateLimit': True})
+        try:
+            await exchange.load_markets()
+            logging.info(f"Usando exchange: {cls_name}")
+            return exchange
+        except ExchangeNotAvailable as e:
+            logging.warning(f"{cls_name} indisponível ({e}), tentando próximo...")
+            await exchange.close()
+    raise RuntimeError("Nenhuma exchange disponível")
 
 async def safe_fetch_ohlcv(exchange, symbol, timeframe, limit):
     """
@@ -50,9 +67,9 @@ async def safe_fetch_ohlcv(exchange, symbol, timeframe, limit):
             df.set_index("timestamp", inplace=True)
             return df
         except Exception as e:
-            logging.warning(f"fetch_ohlcv failed (attempt {attempt}/{MAX_RETRIES}): {e}")
+            logging.warning(f"fetch_ohlcv falhou (tentativa {attempt}/{MAX_RETRIES}): {e}")
             await asyncio.sleep(RETRY_DELAY)
-    logging.error("fetch_ohlcv failed after max retries")
+    logging.error("fetch_ohlcv falhou após tentativas")
     return None
 
 async def wait_until_next_minute():
@@ -128,29 +145,31 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 async def main():
-    exchange = ccxt.binance({"enableRateLimit": True})
-    await exchange.load_markets()
+    # carrega exchange (binance ou binanceus)
+    exchange = await create_exchange()
+
     balance = INITIAL_BALANCE
     position = None  # {"side":"long"/"short", "entry":float}
 
-    logging.info(f"Starting paper trading simulation — initial balance {balance:.2f} USDT")
+    logging.info(f"Paper trading simulation — initial balance {balance:.2f} USDT")
 
     try:
         while True:
-            # sincroniza com fechamento de candle
+            # espera fechamento do candle
             await wait_until_next_minute()
 
             # fetch de candles
             df = await safe_fetch_ohlcv(exchange, SYMBOL, TIMEFRAME, FETCH_LIMIT)
             if df is None or len(df) < LOOKBACK:
-                logging.info(f"Aguardando acumular candles: {len(df) if df is not None else 0}/{LOOKBACK}")
+                cnt = len(df) if df is not None else 0
+                logging.info(f"Acumulando candles ({cnt}/{LOOKBACK})")
                 continue
 
             # calcula indicadores e sinais
             df = compute_indicators(df)
             df = generate_signals(df)
 
-            # sinal do último candle fechado
+            # sinal do candle fechado
             sig = int(df["signal"].iat[-2])
             next_open = df["open"].iat[-1]
 
@@ -160,7 +179,7 @@ async def main():
                 position = {"side": side, "entry": next_open}
                 logging.info(f"[ENTRY] {side.upper()} @ {next_open:.2f}")
 
-            # gerenciamento de posição
+            # gestão da posição aberta
             if position:
                 ticker = await exchange.fetch_ticker(SYMBOL)
                 last_price = float(ticker["last"])
