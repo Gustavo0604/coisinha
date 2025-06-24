@@ -1,196 +1,138 @@
-#!/usr/bin/env python3
-"""
-Async Live Scalping Bot — Paper Trading fiel ao Backtest Intrabar
-
-Após abrir posição no open do candle, faz polling a cada segundo
-para detectar TP/SL via high/low intrabar — igual ao backtest.
-
-Requisitos:
-    pip install ccxt pandas numpy
-
-Uso:
-    python live_scalping_intrabar.py
-    Ctrl+C para encerrar.
-"""
-
-import asyncio
-import logging
-from datetime import datetime, timezone
+import ccxt, time, csv
 import pandas as pd
-import ccxt.async_support as ccxt
-from ccxt.base.errors import ExchangeNotAvailable
+import numpy as np
+from datetime import datetime, timedelta
 
-# ------------------------
-# CONFIGURAÇÕES GERAIS
-# ------------------------
-SYMBOL          = "BTC/USDT"
-TIMEFRAME       = "1m"
-FETCH_LIMIT     = 300
-LOOKBACK        = 50
-INITIAL_BALANCE = 450.0
-PROFIT_TARGET   = 0.10  # USD
-STOP_LOSS       = 0.12  # USD
-MAX_RETRIES     = 5
-RETRY_DELAY     = 2     # segundos
-POLL_INTERVAL   = 1     # segundos entre polls intrabar
-# ------------------------
+# ===== CONFIGURAÇÃO =====
+exchange = ccxt.binance()
+symbol   = 'BTC/USDT'
+timeframe= '4h'
+limit    = 1000
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# Parâmetros finalistas (exemplo: conjunto #1 do walk‐forward)
+params = {
+    'atr_w':       21,
+    'grid_lev':    3,
+    'ent_i':       2,
+    'ex_i':        2,
+    'ma_w':        50,
+    'vol_thr_mul': 1.2,
+    'vol_vol_mul': 0.8,
+    'sl_mul':      1.0,
+    'tp_mul':      1.0,
+    'cost':        0.0004,
+    'slip':        0.0005,
+}
 
-async def create_exchange():
-    for cls_name in ('binance', 'binanceus'):
-        exchange = getattr(ccxt, cls_name)({'enableRateLimit': True})
-        try:
-            await exchange.load_markets()
-            logging.info(f"Usando exchange: {cls_name}")
-            return exchange
-        except ExchangeNotAvailable as e:
-            logging.warning(f"{cls_name} indisponível ({e}), tentando próximo…")
-            await exchange.close()
-    raise RuntimeError("Nenhuma exchange disponível")
+# Conta de paper
+capital0 = 10_000.0
+capital  = capital0
+position = 0       # 1 = long, -1 = short, 0 = flat
+entry_p   = None
 
-async def safe_fetch_ohlcv(exchange, symbol, timeframe, limit):
-    for i in range(1, MAX_RETRIES+1):
-        try:
-            data = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df.set_index("timestamp", inplace=True)
-            return df
-        except Exception as e:
-            logging.warning(f"fetch_ohlcv falhou (tentativa {i}/{MAX_RETRIES}): {e}")
-            await asyncio.sleep(RETRY_DELAY)
-    logging.error("fetch_ohlcv falhou após tentativas")
-    return None
+# Arquivo de log
+logfile = 'paper_trades.csv'
+with open(logfile, 'w', newline='') as f:
+    w = csv.writer(f)
+    w.writerow(['timestamp','action','price','capital','pnl'])
 
-async def wait_until_next_minute():
-    now = datetime.now(timezone.utc)
-    secs = 60 - now.second - now.microsecond/1e6
-    await asyncio.sleep(secs + 0.1)
+# Função que decide ações ao final de cada candle
+def on_new_candle(df):
+    global capital, position, entry_p
+    p = params
+    df = df.copy()
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    delta = df["close"].diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df["rsi14"] = 100 - (100 / (1+rs))
-    df["bb_mid"]   = df["close"].rolling(20).mean()
-    df["bb_std"]   = df["close"].rolling(20).std()
-    df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
-    df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
-    return df
+    # calcula indicadores
+    df['tr']  = np.maximum(df.high - df.low,
+                  np.maximum((df.high - df.close.shift()).abs(),
+                             (df.low  - df.close.shift()).abs()))
+    df['atr'] = df.tr.rolling(p['atr_w']).mean()
+    df['ma']  = df.close.rolling(p['ma_w']).mean()
+    df['atr_m']   = df.atr.rolling(p['atr_w']).mean()
+    df['vol_thr'] = df['atr_m'] * p['vol_thr_mul']
+    df['vol_m']   = df.volume.rolling(p['atr_w']).mean()
+    df['vol_thr_v'] = df['vol_m'] * p['vol_vol_mul']
 
-def detect_trend(df: pd.DataFrame, idx: int) -> str:
-    return "up" if df["ema20"].iat[idx] > df["ema50"].iat[idx] else \
-           "down" if df["ema20"].iat[idx] < df["ema50"].iat[idx] else "side"
+    # último candle
+    ts = df.index[-1]
+    price = df.close.iloc[-1]
+    atr   = df.atr.iloc[-1]
+    ma    = df.ma.iloc[-1]
+    vol   = df.volume.iloc[-1]
 
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
-    df["signal"] = 0
-    support    = df["low"].rolling(50).min()
-    resistance = df["high"].rolling(50).max()
-    vol20      = df["volume"].rolling(20).mean()
+    # se under filters, nada
+    if vol <= df.vol_thr_v.iloc[-1] or atr <= df.vol_thr.iloc[-1]:
+        return
 
-    for i in range(LOOKBACK, len(df)-1):
-        price = df["close"].iat[i]
-        rsi   = df["rsi14"].iat[i]
-        trend = detect_trend(df, i)
+    center = df.close.iloc[-2]
+    levels = np.linspace(center-atr, center+atr, p['grid_lev']+1)
 
-        # Pullback
-        if trend=="up" and df["low"].iat[i] <= df["ema20"].iat[i] and rsi<30 and df["close"].iat[i]>df["open"].iat[i]:
-            df.at[df.index[i],"signal"] = 1
-        if trend=="down" and df["high"].iat[i] >= df["ema20"].iat[i] and rsi>70 and df["close"].iat[i]<df["open"].iat[i]:
-            df.at[df.index[i],"signal"] = -1
+    buy_p  = price*(1+p['slip'])*(1+p['cost'])
+    sell_p = price*(1-p['slip'])*(1-p['cost'])
 
-        # Range reversal
-        if abs(price-support.iat[i])<0.5 and rsi<20:
-            df.at[df.index[i],"signal"] = 1
-        if abs(price-resistance.iat[i])<0.5 and rsi>80:
-            df.at[df.index[i],"signal"] = -1
+    action = None
+    # ENTRADA LONG
+    if position==0 and price > levels[p['ent_i']] and price > ma:
+        position = 1
+        entry_p  = buy_p
+        action   = 'BUY'
+    # ENTRADA SHORT
+    elif position==0 and price < levels[-p['ent_i']] and price < ma:
+        position = -1
+        entry_p  = sell_p
+        action   = 'SELL'
+    # SAÍDA
+    elif position != 0:
+        slp = entry_p - position*p['sl_mul']*atr
+        tpp = entry_p + position*p['tp_mul']*atr
+        exit_p = None
+        if (position==1 and price>=tpp) or (position==-1 and price<=tpp):
+            exit_p = tpp*(1-position*p['slip'])*(1-p['cost'])
+            action = 'TP'
+        elif (position==1 and price<=slp) or (position==-1 and price>=slp):
+            exit_p = slp*(1+position*p['slip'])*(1-p['cost'])
+            action = 'SL'
+        elif position==1 and price < levels[-p['ex_i']]:
+            exit_p = sell_p; action='GRID_EXIT'
+        elif position==-1 and price > levels[p['ex_i']]:
+            exit_p = buy_p;  action='GRID_EXIT'
 
-        # Breakout
-        high5 = df["high"].iloc[i-5:i].max()
-        low5  = df["low"].iloc[i-5:i].min()
-        if df["close"].iat[i]>high5 and df["volume"].iat[i]>vol20.iat[i]:
-            df.at[df.index[i],"signal"] = 1
-        if df["close"].iat[i]<low5 and df["volume"].iat[i]>vol20.iat[i]:
-            df.at[df.index[i],"signal"] = -1
+        if exit_p is not None:
+            pnl = position*(exit_p-entry_p)/entry_p * capital
+            capital += pnl
+            position = 0
 
-    return df
+    # Loga no CSV
+    if action:
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        pnl  = (capital-capital0) if action=='TP' or action=='SL' or action=='GRID_EXIT' else 0
+        with open(logfile, 'a', newline='') as f:
+            csv.writer(f).writerow([now, action, price, round(capital,2), round(pnl,2)])
+        print(f"[{now}] {action} @ {price:.2f}  Capital: {capital:.2f}  PnL: {pnl:.2f}")
 
-async def intrabar_exit(exchange, entry_price, side):
-    """
-    Faz polling do candle atual (limit=1) para detectar TP/SL intrabar.
-    Retorna o preço de saída.
-    """
-    while True:
-        ohlcv = await exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=1)
-        ts, o, h, l, c, v = ohlcv[0]
-        # intrabar TP/SL
-        if side=="long":
-            if h >= entry_price + PROFIT_TARGET:
-                return entry_price + PROFIT_TARGET
-            if l <= entry_price - STOP_LOSS:
-                return entry_price - STOP_LOSS
-        else:
-            if l <= entry_price - PROFIT_TARGET:
-                return entry_price - PROFIT_TARGET
-            if h >= entry_price + STOP_LOSS:
-                return entry_price + STOP_LOSS
-        # fim do minuto?
-        now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
-        if now_ms >= ts + 60_000:
-            return c  # fecha ao close do candle
-        await asyncio.sleep(POLL_INTERVAL)
+# Inicializa histórico
+ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+df.timestamp = pd.to_datetime(df.timestamp, unit='ms')
+df.set_index('timestamp', inplace=True)
 
-async def main():
-    exchange = await create_exchange()
-    balance = INITIAL_BALANCE
-    logging.info(f"Paper trading intrabar — saldo inicial {balance:.2f} USDT")
+# Loop principal: espera fechamento de cada candle de 4h
+print("⏳ Aguarde o próximo fechamento de candle para iniciar o teste real-time...")
+while True:
+    # calcula próximo timestamp de fechamento
+    last = df.index[-1]
+    next_close = last + pd.to_timedelta(timeframe)
+    sleep_secs = (next_close - datetime.utcnow()).total_seconds()
+    if sleep_secs > 0:
+        time.sleep(sleep_secs + 1)
 
-    try:
-        while True:
-            await wait_until_next_minute()
-
-            df = await safe_fetch_ohlcv(exchange, SYMBOL, TIMEFRAME, FETCH_LIMIT)
-            if df is None or len(df)<LOOKBACK:
-                cnt = len(df) if df is not None else 0
-                logging.info(f"Acumulando candles ({cnt}/{LOOKBACK})")
-                continue
-
-            df = compute_indicators(df)
-            df = generate_signals(df)
-
-            sig = int(df["signal"].iat[-2])
-            next_open = df["open"].iat[-1]
-
-            # ENTRY
-            if sig!=0:
-                side = "long" if sig==1 else "short"
-                entry = next_open
-                logging.info(f"[ENTRY] {side.upper()} @ {entry:.2f}")
-                exit_price = await intrabar_exit(exchange, entry, side)
-
-                # calcula PnL
-                pnl =  (exit_price - entry) if side=="long" else (entry - exit_price)
-                balance += pnl
-                tag = "TP" if pnl>0 else "SL" if pnl<0 else "EXIT"
-                logging.info(f"[{tag}] {side.upper()} {pnl:+.2f} @ {exit_price:.2f} → Balance {balance:.2f}")
-
-            else:
-                logging.info(f"No position — balance {balance:.2f} USDT")
-
-    except KeyboardInterrupt:
-        logging.info("Bot parado pelo usuário.")
-    finally:
-        await exchange.close()
-        logging.info(f"Saldo final: {balance:.2f} USDT")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # busca candle novo
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=2)
+    new = ohlcv[-1]
+    ts  = pd.to_datetime(new[0], unit='ms')
+    if ts > df.index[-1]:
+        df = df.append(pd.DataFrame([new[1:]], index=[ts], columns=['open','high','low','close','volume']))
+        on_new_candle(df)
+    else:
+        # se já atualizou, espera um intervalo para não spammar API
+        time.sleep(30)
