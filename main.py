@@ -1,138 +1,366 @@
-import ccxt, time, csv
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Bot de Trading de Bitcoin com IA e Aprendizado de Máquina
++ Dashboard Rich profissional em full-screen no terminal
+Operação: BTC/USDT spot na Binance (Testnet), paper trading
+Timeframes: 1m e 5m
+Capital inicial (virtual): US$ 450
+Meta de lucro: ~0.8% diário
+Acurácia alvo: ≥ 86%
+"""
+
+import os
+import time
+import requests
+import numpy  as np
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
+from collections import deque
 
-# ===== CONFIGURAÇÃO =====
-exchange = ccxt.binance()
-symbol   = 'BTC/USDT'
-timeframe= '4h'
-limit    = 1000
+from binance.client    import Client
+from binance.enums     import *
+from binance.exceptions import BinanceAPIException
 
-# Parâmetros finalistas (exemplo: conjunto #1 do walk‐forward)
-params = {
-    'atr_w':       21,
-    'grid_lev':    3,
-    'ent_i':       2,
-    'ex_i':        2,
-    'ma_w':        50,
-    'vol_thr_mul': 1.2,
-    'vol_vol_mul': 0.8,
-    'sl_mul':      1.0,
-    'tp_mul':      1.0,
-    'cost':        0.0004,
-    'slip':        0.0005,
-}
+from sklearn.preprocessing      import StandardScaler
+from sklearn.model_selection    import train_test_split
+from tensorflow.keras.models    import Sequential
+from tensorflow.keras.layers    import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
 
-# Conta de paper
-capital0 = 10_000.0
-capital  = capital0
-position = 0       # 1 = long, -1 = short, 0 = flat
-entry_p   = None
+from rich.live    import Live
+from rich.layout  import Layout
+from rich.panel   import Panel
+from rich.table   import Table
+from rich.text    import Text
+from rich.console import Console
+from rich.align   import Align
+from rich import box
 
-# Arquivo de log
-logfile = 'paper_trades.csv'
-with open(logfile, 'w', newline='') as f:
-    w = csv.writer(f)
-    w.writerow(['timestamp','action','price','capital','pnl'])
+console = Console()
 
-# Função que decide ações ao final de cada candle
-def on_new_candle(df):
-    global capital, position, entry_p
-    p = params
+# ---------------------------------------------------------------------
+# Configurações de API Binance (Testnet)
+# ---------------------------------------------------------------------
+API_KEY    = os.getenv("BINANCE_API_KEY", "SUA_API_KEY_TESTNET")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "SEU_API_SECRET_TESTNET")
+
+client = Client(API_KEY, API_SECRET)
+client.API_URL = 'https://testnet.binance.vision/api'
+
+SYMBOL      = "BTCUSDT"
+INITIAL_USD = 450.0
+POSITION    = 0.0   # BTC
+USD_BALANCE = INITIAL_USD
+
+# Parâmetros de estratégia
+TARGET_DAILY_RETURN = 0.008    # 0.8% diário
+TARGET_ACCURACY      = 0.86
+TIMEFRAMES           = ["1m", "5m"]
+FEATURE_WINDOW       = 20       # janelas de tempo para modelo
+RETRAIN_INTERVAL     = 24 * 60 * 60  # 1 dia em segundos
+
+# Histórico de trades para o log do dashboard
+trade_log = deque(maxlen=10)
+
+# ---------------------------------------------------------------------
+# Helpers: indicadores técnicos
+# ---------------------------------------------------------------------
+def EMA(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def RSI(series, period=14):
+    delta = series.diff()
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    ma_up   = up.rolling(window=period).mean()
+    ma_down = down.rolling(window=period).mean()
+    rs      = ma_up / ma_down
+    return 100 - 100/(1+rs)
+
+def MACD(df, fast=12, slow=26, signal=9):
+    ema_fast    = EMA(df['close'], fast)
+    ema_slow    = EMA(df['close'], slow)
+    macd_line   = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
+
+def BBANDS(df, period=20, stddev=2):
+    ma    = df['close'].rolling(window=period).mean()
+    sd    = df['close'].rolling(window=period).std()
+    upper = ma + stddev * sd
+    lower = ma - stddev * sd
+    return upper, lower
+
+# ---------------------------------------------------------------------
+# Sentimento real via API gratuita (Alternative.me)
+# ---------------------------------------------------------------------
+def fetch_sentiment():
+    try:
+        resp = requests.get(
+            "https://api.alternative.me/fng/?limit=1&format=json",
+            timeout=5
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return int(data["data"][0]["value"])
+    except Exception as e:
+        console.log(f"[Sentiment API error] {e}")
+        return np.nan
+
+# ---------------------------------------------------------------------
+# Coleta e Pré-processamento
+# ---------------------------------------------------------------------
+def fetch_klines(symbol, interval, lookback_days=365):
+    end_time   = datetime.utcnow()
+    start_time = end_time - timedelta(days=lookback_days)
+    data = client.get_historical_klines(
+        symbol, interval,
+        start_str=str(start_time),
+        end_str=str(end_time),
+        limit=1000
+    )
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","num_trades","taker_base","taker_quote","ignore"
+    ])
+    df = df[['open_time','open','high','low','close','volume']]
+    df[['open','high','low','close','volume']] = \
+        df[['open','high','low','close','volume']].astype(float)
+    df['dt'] = pd.to_datetime(df['open_time'], unit='ms')
+    df.set_index('dt', inplace=True)
+    return df
+
+def build_features(df):
     df = df.copy()
+    df['ema_20']     = EMA(df['close'], 20)
+    df['rsi14']      = RSI(df['close'], 14)
+    df['macd'], df['macd_sig'] = MACD(df)
+    df['bb_upper'], df['bb_lower'] = BBANDS(df)
+    df['ret_1']      = df['close'].pct_change(1)
+    df['ret_5']      = df['close'].pct_change(5)
+    df['vol']        = df['volume'] / df['volume'].rolling(20).mean()
+    df['hour']       = df.index.hour
+    df['dow']        = df.index.dayofweek
+    df['sentiment']  = fetch_sentiment()
+    df.dropna(inplace=True)
+    return df
 
-    # calcula indicadores
-    df['tr']  = np.maximum(df.high - df.low,
-                  np.maximum((df.high - df.close.shift()).abs(),
-                             (df.low  - df.close.shift()).abs()))
-    df['atr'] = df.tr.rolling(p['atr_w']).mean()
-    df['ma']  = df.close.rolling(p['ma_w']).mean()
-    df['atr_m']   = df.atr.rolling(p['atr_w']).mean()
-    df['vol_thr'] = df['atr_m'] * p['vol_thr_mul']
-    df['vol_m']   = df.volume.rolling(p['atr_w']).mean()
-    df['vol_thr_v'] = df['vol_m'] * p['vol_vol_mul']
+def label_data(df, threshold=0.001):
+    future_ret = df['close'].shift(-1) / df['close'] - 1
+    df['label'] = (future_ret > threshold).astype(int)
+    df.dropna(inplace=True)
+    return df
 
-    # último candle
-    ts = df.index[-1]
-    price = df.close.iloc[-1]
-    atr   = df.atr.iloc[-1]
-    ma    = df.ma.iloc[-1]
-    vol   = df.volume.iloc[-1]
+# ---------------------------------------------------------------------
+# Treinamento do Modelo
+# ---------------------------------------------------------------------
+def train_model(df):
+    features = [c for c in df.columns if c not in ['open_time','close','label','volume']]
+    X = df[features].values
+    y = df['label'].values
 
-    # se under filters, nada
-    if vol <= df.vol_thr_v.iloc[-1] or atr <= df.vol_thr.iloc[-1]:
-        return
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-    center = df.close.iloc[-2]
-    levels = np.linspace(center-atr, center+atr, p['grid_lev']+1)
+    X_lstm, y_lstm = [], []
+    for i in range(FEATURE_WINDOW, len(X_scaled)):
+        X_lstm.append(X_scaled[i-FEATURE_WINDOW:i])
+        y_lstm.append(y[i])
+    X_lstm, y_lstm = np.array(X_lstm), np.array(y_lstm)
 
-    buy_p  = price*(1+p['slip'])*(1+p['cost'])
-    sell_p = price*(1-p['slip'])*(1-p['cost'])
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_lstm, y_lstm, test_size=0.2, shuffle=False
+    )
 
-    action = None
-    # ENTRADA LONG
-    if position==0 and price > levels[p['ent_i']] and price > ma:
-        position = 1
-        entry_p  = buy_p
-        action   = 'BUY'
-    # ENTRADA SHORT
-    elif position==0 and price < levels[-p['ent_i']] and price < ma:
-        position = -1
-        entry_p  = sell_p
-        action   = 'SELL'
-    # SAÍDA
-    elif position != 0:
-        slp = entry_p - position*p['sl_mul']*atr
-        tpp = entry_p + position*p['tp_mul']*atr
-        exit_p = None
-        if (position==1 and price>=tpp) or (position==-1 and price<=tpp):
-            exit_p = tpp*(1-position*p['slip'])*(1-p['cost'])
-            action = 'TP'
-        elif (position==1 and price<=slp) or (position==-1 and price>=slp):
-            exit_p = slp*(1+position*p['slip'])*(1-p['cost'])
-            action = 'SL'
-        elif position==1 and price < levels[-p['ex_i']]:
-            exit_p = sell_p; action='GRID_EXIT'
-        elif position==-1 and price > levels[p['ex_i']]:
-            exit_p = buy_p;  action='GRID_EXIT'
+    model = Sequential([
+        LSTM(64, input_shape=(FEATURE_WINDOW, X_lstm.shape[2]), return_sequences=True),
+        Dropout(0.2),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(16, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
 
-        if exit_p is not None:
-            pnl = position*(exit_p-entry_p)/entry_p * capital
-            capital += pnl
-            position = 0
+    early = EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True)
+    model.fit(X_train, y_train, validation_data=(X_test, y_test),
+              epochs=50, batch_size=64, callbacks=[early], verbose=0)
 
-    # Loga no CSV
-    if action:
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        pnl  = (capital-capital0) if action=='TP' or action=='SL' or action=='GRID_EXIT' else 0
-        with open(logfile, 'a', newline='') as f:
-            csv.writer(f).writerow([now, action, price, round(capital,2), round(pnl,2)])
-        print(f"[{now}] {action} @ {price:.2f}  Capital: {capital:.2f}  PnL: {pnl:.2f}")
+    loss, acc = model.evaluate(X_test, y_test, verbose=0)
+    console.log(f"[Treino] Acurácia no teste: {acc*100:.2f}%")
+    return model, scaler, features
 
-# Inicializa histórico
-ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-df.timestamp = pd.to_datetime(df.timestamp, unit='ms')
-df.set_index('timestamp', inplace=True)
+# ---------------------------------------------------------------------
+# Backtesting Simples
+# ---------------------------------------------------------------------
+def backtest(df, model, scaler, features):
+    cash, btc = INITIAL_USD, 0.0
+    X = df[features].values
+    X_scaled = scaler.transform(X)
+    for i in range(FEATURE_WINDOW, len(df)-1):
+        window = X_scaled[i-FEATURE_WINDOW:i]
+        p = model.predict(window[np.newaxis,:,:], verbose=0)[0,0]
+        price = df['close'].iloc[i]
+        if p > 0.8 and cash > 0:
+            qty = (cash * 0.05) / price
+            cash -= qty * price
+            btc  += qty
+        elif p < 0.2 and btc > 0:
+            cash += btc * price
+            btc = 0
+    final = cash + btc * df['close'].iloc[-1]
+    pnl   = (final - INITIAL_USD) / INITIAL_USD * 100
+    console.log(f"[Backtest] Valor final: ${final:.2f} | PnL: {pnl:.2f}%")
 
-# Loop principal: espera fechamento de cada candle de 4h
-print("⏳ Aguarde o próximo fechamento de candle para iniciar o teste real-time...")
-while True:
-    # calcula próximo timestamp de fechamento
-    last = df.index[-1]
-    next_close = last + pd.to_timedelta(timeframe)
-    sleep_secs = (next_close - datetime.utcnow()).total_seconds()
-    if sleep_secs > 0:
-        time.sleep(sleep_secs + 1)
+# ---------------------------------------------------------------------
+# Monta layout Rich
+# ---------------------------------------------------------------------
+def make_layout() -> Layout:
+    layout = Layout(name="root")
 
-    # busca candle novo
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=2)
-    new = ohlcv[-1]
-    ts  = pd.to_datetime(new[0], unit='ms')
-    if ts > df.index[-1]:
-        df = df.append(pd.DataFrame([new[1:]], index=[ts], columns=['open','high','low','close','volume']))
-        on_new_candle(df)
-    else:
-        # se já atualizou, espera um intervalo para não spammar API
-        time.sleep(30)
+    layout.split(
+        Layout(name="header", size=3),
+        Layout(name="body", ratio=1),
+        Layout(name="footer", size=3)
+    )
+
+    layout["body"].split_row(
+        Layout(name="metrics", ratio=2),
+        Layout(name="trades", ratio=3)
+    )
+    return layout
+
+def render_header() -> Panel:
+    header_text = Text("🚀 BTC/USDT Trading Bot Dashboard", style="bold white on blue", justify="center")
+    return Panel(header_text, box=box.DOUBLE)
+
+def render_metrics(p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION):
+    total = USD_BALANCE + POSITION * price
+    pnl   = (total - INITIAL_USD) / INITIAL_USD * 100
+
+    table = Table.grid(expand=True)
+    table.add_column(justify="right")
+    table.add_column(justify="left")
+    table.add_row("Signal:", f"{p*100:5.1f}%")
+    table.add_row("Sentiment:", f"{sentiment:.1f}%")
+    table.add_row("Stress:", f"{stress:.1f}%")
+    table.add_row("EMA OK:", str(ema_ok))
+    table.add_row("RSI OK:", str(rsi_ok))
+    table.add_row("USD Bal:", f"{USD_BALANCE:8.2f}")
+    table.add_row("BTC Pos:", f"{POSITION:8.5f}")
+    table.add_row("Total $:", f"{total:8.2f}")
+    table.add_row("PnL %:", f"{pnl:6.2f}%")
+    return Panel(table, title="📊 Metrics", box=box.ROUNDED)
+
+def render_trades():
+    table = Table(title="⌛ Últimos Trades", box=box.SIMPLE_HEAVY)
+    table.add_column("Time",       justify="left", no_wrap=True)
+    table.add_column("Action",     justify="center")
+    table.add_column("Qty",        justify="right")
+    table.add_column("Price",      justify="right")
+    table.add_column("P/L",        justify="right")
+
+    for t in trade_log:
+        table.add_row(*t)
+    return Panel(table, title="📝 Trade Log", box=box.ROUNDED)
+
+def render_footer():
+    text = Text("Press Ctrl+C to exit", style="dim")
+    return Panel(Align.center(text), box=box.SIMPLE)
+
+# ---------------------------------------------------------------------
+# Loop de Paper Trading com Dashboard
+# ---------------------------------------------------------------------
+def run_paper_trading(model, scaler, features):
+    global USD_BALANCE, POSITION, price
+
+    last_retrain = time.time()
+    layout = make_layout()
+
+    with Live(layout, refresh_per_second=1, screen=True):
+        while True:
+            try:
+                # Re-treina diariamente
+                if time.time() - last_retrain > RETRAIN_INTERVAL:
+                    console.log(f"[Bot] Re-treinando modelo às {datetime.utcnow()} UTC...")
+                    df_hist = fetch_klines(SYMBOL, TIMEFRAMES[1])
+                    df_feat = label_data(build_features(df_hist))
+                    model, scaler, features = train_model(df_feat)
+                    last_retrain = time.time()
+
+                # Coleta último candle
+                klines = client.get_klines(symbol=SYMBOL, interval=TIMEFRAMES[0], limit=FEATURE_WINDOW+1)
+                df_live= pd.DataFrame(klines, columns=[
+                    "open_time","open","high","low","close","volume","close_time",
+                    "qav","num_trades","tb","tq","ignore"
+                ])
+                df_live[['open','high','low','close','volume']] = \
+                    df_live[['open','high','low','close','volume']].astype(float)
+                df_live['dt'] = pd.to_datetime(df_live['open_time'], unit='ms')
+                df_live.set_index('dt', inplace=True)
+                df_feat = build_features(df_live)
+
+                window    = scaler.transform(df_feat[features].values)[-FEATURE_WINDOW:]
+                p         = model.predict(window[np.newaxis,:,:], verbose=0)[0,0]
+                price     = df_feat['close'].iloc[-1]
+                sentiment = df_feat['sentiment'].iloc[-1]
+                stress    = df_feat['vol'].iloc[-1] * 100
+                ema_ok    = df_feat['close'].iloc[-1] > df_feat['ema_20'].iloc[-1]
+                rsi_ok    = df_feat['rsi14'].iloc[-1] < 70
+
+                action, qty, pl = "-", "", ""
+                if p > 0.8 and ema_ok and rsi_ok and USD_BALANCE > 0:
+                    qty = (USD_BALANCE * min(p, 0.5)) / price
+                    USD_BALANCE -= qty * price
+                    POSITION     += qty
+                    action = "BUY"
+                    pl     = ""
+                    trade_log.append((
+                        datetime.utcnow().strftime("%H:%M:%S"),
+                        action,
+                        f"{qty:.5f}",
+                        f"{price:.2f}",
+                        pl
+                    ))
+                elif p < 0.2 and POSITION > 0:
+                    USD_BALANCE += POSITION * price
+                    action = "SELL"
+                    pl     = f"{((price / trade_log[-1][3] - 1)*100):.2f}%"
+                    trade_log.append((
+                        datetime.utcnow().strftime("%H:%M:%S"),
+                        action,
+                        f"{POSITION:.5f}",
+                        f"{price:.2f}",
+                        pl
+                    ))
+                    POSITION = 0
+
+                # Atualiza layout
+                layout["header"].update(render_header())
+                layout["metrics"].update(render_metrics(
+                    p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION
+                ))
+                layout["trades"].update(render_trades())
+                layout["footer"].update(render_footer())
+
+                time.sleep(60)
+
+            except KeyboardInterrupt:
+                console.log("Encerrando...")
+                return
+            except Exception as e:
+                console.log("[Erro]", e)
+                time.sleep(5)
+
+# ---------------------------------------------------------------------
+# Fluxo Principal
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    console.log("📈 Preparando dados e modelo...")
+    df_hist = fetch_klines(SYMBOL, TIMEFRAMES[1], lookback_days=365)
+    df_feat = label_data(build_features(df_hist))
+
+    model, scaler, features = train_model(df_feat)
+    backtest(df_feat, model, scaler, features)
+    run_paper_trading(model, scaler, features)
