@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Bot de Trading de Bitcoin com IA e Aprendizado de Máquina
-+ Dashboard Rich profissional em full-screen no terminal
-Operação: BTC/USDT spot na Binance (Testnet), paper trading
-Timeframes: 1m e 5m
-Capital inicial (virtual): US$ 450
-Meta de lucro: ~0.8% diário
-Acurácia alvo: ≥ 86%
-"""
-
 import os
 import time
 import requests
@@ -38,16 +25,14 @@ from rich.console import Console
 from rich.align   import Align
 from rich import box
 
-console = Console()
-
 # ---------------------------------------------------------------------
 # Configurações de API Binance (Testnet)
 # ---------------------------------------------------------------------
 API_KEY    = os.getenv("BINANCE_API_KEY", "SUA_API_KEY_TESTNET")
 API_SECRET = os.getenv("BINANCE_API_SECRET", "SEU_API_SECRET_TESTNET")
 
-client = Client(API_KEY, API_SECRET)
-client.API_URL = 'https://testnet.binance.vision/api'
+# Inicializa cliente já apontando para Testnet
+client = Client(API_KEY, API_SECRET, testnet=True)
 
 SYMBOL      = "BTCUSDT"
 INITIAL_USD = 450.0
@@ -63,6 +48,8 @@ RETRAIN_INTERVAL     = 24 * 60 * 60  # 1 dia em segundos
 
 # Histórico de trades para o log do dashboard
 trade_log = deque(maxlen=10)
+
+console = Console()
 
 # ---------------------------------------------------------------------
 # Helpers: indicadores técnicos
@@ -218,13 +205,11 @@ def backtest(df, model, scaler, features):
 # ---------------------------------------------------------------------
 def make_layout() -> Layout:
     layout = Layout(name="root")
-
     layout.split(
         Layout(name="header", size=3),
         Layout(name="body", ratio=1),
         Layout(name="footer", size=3)
     )
-
     layout["body"].split_row(
         Layout(name="metrics", ratio=2),
         Layout(name="trades", ratio=3)
@@ -235,16 +220,15 @@ def render_header() -> Panel:
     header_text = Text("🚀 BTC/USDT Trading Bot Dashboard", style="bold white on blue", justify="center")
     return Panel(header_text, box=box.DOUBLE)
 
-def render_metrics(p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION):
+def render_metrics(p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION, price):
     total = USD_BALANCE + POSITION * price
     pnl   = (total - INITIAL_USD) / INITIAL_USD * 100
-
     table = Table.grid(expand=True)
     table.add_column(justify="right")
     table.add_column(justify="left")
     table.add_row("Signal:", f"{p*100:5.1f}%")
-    table.add_row("Sentiment:", f"{sentiment:.1f}%")
-    table.add_row("Stress:", f"{stress:.1f}%")
+    table.add_row("Sentiment:", f"{sentiment:5.1f}%")
+    table.add_row("Stress:", f"{stress:5.1f}%")
     table.add_row("EMA OK:", str(ema_ok))
     table.add_row("RSI OK:", str(rsi_ok))
     table.add_row("USD Bal:", f"{USD_BALANCE:8.2f}")
@@ -260,7 +244,6 @@ def render_trades():
     table.add_column("Qty",        justify="right")
     table.add_column("Price",      justify="right")
     table.add_column("P/L",        justify="right")
-
     for t in trade_log:
         table.add_row(*t)
     return Panel(table, title="📝 Trade Log", box=box.ROUNDED)
@@ -273,11 +256,9 @@ def render_footer():
 # Loop de Paper Trading com Dashboard
 # ---------------------------------------------------------------------
 def run_paper_trading(model, scaler, features):
-    global USD_BALANCE, POSITION, price
-
+    global USD_BALANCE, POSITION
     last_retrain = time.time()
     layout = make_layout()
-
     with Live(layout, refresh_per_second=1, screen=True):
         while True:
             try:
@@ -301,6 +282,7 @@ def run_paper_trading(model, scaler, features):
                 df_live.set_index('dt', inplace=True)
                 df_feat = build_features(df_live)
 
+                # Previsão
                 window    = scaler.transform(df_feat[features].values)[-FEATURE_WINDOW:]
                 p         = model.predict(window[np.newaxis,:,:], verbose=0)[0,0]
                 price     = df_feat['close'].iloc[-1]
@@ -309,24 +291,25 @@ def run_paper_trading(model, scaler, features):
                 ema_ok    = df_feat['close'].iloc[-1] > df_feat['ema_20'].iloc[-1]
                 rsi_ok    = df_feat['rsi14'].iloc[-1] < 70
 
-                action, qty, pl = "-", "", ""
+                action, pl = "-", ""
+                qty = 0.0
                 if p > 0.8 and ema_ok and rsi_ok and USD_BALANCE > 0:
                     qty = (USD_BALANCE * min(p, 0.5)) / price
                     USD_BALANCE -= qty * price
                     POSITION     += qty
                     action = "BUY"
-                    pl     = ""
                     trade_log.append((
                         datetime.utcnow().strftime("%H:%M:%S"),
                         action,
                         f"{qty:.5f}",
                         f"{price:.2f}",
-                        pl
+                        ""
                     ))
                 elif p < 0.2 and POSITION > 0:
                     USD_BALANCE += POSITION * price
                     action = "SELL"
-                    pl     = f"{((price / trade_log[-1][3] - 1)*100):.2f}%"
+                    entry_price = float(trade_log[-1][3]) if trade_log else price
+                    pl = f"{((price / entry_price - 1)*100):.2f}%"
                     trade_log.append((
                         datetime.utcnow().strftime("%H:%M:%S"),
                         action,
@@ -336,19 +319,18 @@ def run_paper_trading(model, scaler, features):
                     ))
                     POSITION = 0
 
-                # Atualiza layout
+                # Atualiza dashboard
                 layout["header"].update(render_header())
                 layout["metrics"].update(render_metrics(
-                    p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION
+                    p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION, price
                 ))
                 layout["trades"].update(render_trades())
                 layout["footer"].update(render_footer())
 
                 time.sleep(60)
-
             except KeyboardInterrupt:
                 console.log("Encerrando...")
-                return
+                break
             except Exception as e:
                 console.log("[Erro]", e)
                 time.sleep(5)
@@ -360,7 +342,6 @@ if __name__ == "__main__":
     console.log("📈 Preparando dados e modelo...")
     df_hist = fetch_klines(SYMBOL, TIMEFRAMES[1], lookback_days=365)
     df_feat = label_data(build_features(df_hist))
-
     model, scaler, features = train_model(df_feat)
     backtest(df_feat, model, scaler, features)
     run_paper_trading(model, scaler, features)
