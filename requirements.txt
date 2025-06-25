@@ -1,2 +1,7 @@
-ccxt>=3.0.0
-pandas>=1.4.0
+python-binance
+pandas
+numpy
+scikit-learn
+tensorflow
+requests
+rich
