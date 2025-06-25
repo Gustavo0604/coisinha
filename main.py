@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Bot de Trading de Bitcoin com IA e Aprendizado de Máquina
+Modo: Paper trading Binance Testnet
+Saídas via print() no terminal (compatível com Railway)
+"""
+
 import os
 import time
 import requests
@@ -15,15 +24,6 @@ from sklearn.model_selection    import train_test_split
 from tensorflow.keras.models    import Sequential
 from tensorflow.keras.layers    import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
-
-from rich.live    import Live
-from rich.layout  import Layout
-from rich.panel   import Panel
-from rich.table   import Table
-from rich.text    import Text
-from rich.console import Console
-from rich.align   import Align
-from rich import box
 
 # ---------------------------------------------------------------------
 # Configurações de API Binance (Testnet)
@@ -46,10 +46,8 @@ TIMEFRAMES           = ["1m", "5m"]
 FEATURE_WINDOW       = 20       # janelas de tempo para modelo
 RETRAIN_INTERVAL     = 24 * 60 * 60  # 1 dia em segundos
 
-# Histórico de trades para o log do dashboard
+# Histórico de trades para log
 trade_log = deque(maxlen=10)
-
-console = Console()
 
 # ---------------------------------------------------------------------
 # Helpers: indicadores técnicos
@@ -92,7 +90,7 @@ def fetch_sentiment():
         data = resp.json()
         return int(data["data"][0]["value"])
     except Exception as e:
-        console.log(f"[Sentiment API error] {e}")
+        print(f"[Sentiment API error] {e}")
         return np.nan
 
 # ---------------------------------------------------------------------
@@ -175,7 +173,7 @@ def train_model(df):
               epochs=50, batch_size=64, callbacks=[early], verbose=0)
 
     loss, acc = model.evaluate(X_test, y_test, verbose=0)
-    console.log(f"[Treino] Acurácia no teste: {acc*100:.2f}%")
+    print(f"[Treino] Acurácia no teste: {acc*100:.2f}%")
     return model, scaler, features
 
 # ---------------------------------------------------------------------
@@ -198,148 +196,102 @@ def backtest(df, model, scaler, features):
             btc = 0
     final = cash + btc * df['close'].iloc[-1]
     pnl   = (final - INITIAL_USD) / INITIAL_USD * 100
-    console.log(f"[Backtest] Valor final: ${final:.2f} | PnL: {pnl:.2f}%")
+    print(f"[Backtest] Valor final: ${final:.2f} | PnL: {pnl:.2f}%")
 
 # ---------------------------------------------------------------------
-# Monta layout Rich
-# ---------------------------------------------------------------------
-def make_layout() -> Layout:
-    layout = Layout(name="root")
-    layout.split(
-        Layout(name="header", size=3),
-        Layout(name="body", ratio=1),
-        Layout(name="footer", size=3)
-    )
-    layout["body"].split_row(
-        Layout(name="metrics", ratio=2),
-        Layout(name="trades", ratio=3)
-    )
-    return layout
-
-def render_header() -> Panel:
-    header_text = Text("🚀 BTC/USDT Trading Bot Dashboard", style="bold white on blue", justify="center")
-    return Panel(header_text, box=box.DOUBLE)
-
-def render_metrics(p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION, price):
-    total = USD_BALANCE + POSITION * price
-    pnl   = (total - INITIAL_USD) / INITIAL_USD * 100
-    table = Table.grid(expand=True)
-    table.add_column(justify="right")
-    table.add_column(justify="left")
-    table.add_row("Signal:", f"{p*100:5.1f}%")
-    table.add_row("Sentiment:", f"{sentiment:5.1f}%")
-    table.add_row("Stress:", f"{stress:5.1f}%")
-    table.add_row("EMA OK:", str(ema_ok))
-    table.add_row("RSI OK:", str(rsi_ok))
-    table.add_row("USD Bal:", f"{USD_BALANCE:8.2f}")
-    table.add_row("BTC Pos:", f"{POSITION:8.5f}")
-    table.add_row("Total $:", f"{total:8.2f}")
-    table.add_row("PnL %:", f"{pnl:6.2f}%")
-    return Panel(table, title="📊 Metrics", box=box.ROUNDED)
-
-def render_trades():
-    table = Table(title="⌛ Últimos Trades", box=box.SIMPLE_HEAVY)
-    table.add_column("Time",       justify="left", no_wrap=True)
-    table.add_column("Action",     justify="center")
-    table.add_column("Qty",        justify="right")
-    table.add_column("Price",      justify="right")
-    table.add_column("P/L",        justify="right")
-    for t in trade_log:
-        table.add_row(*t)
-    return Panel(table, title="📝 Trade Log", box=box.ROUNDED)
-
-def render_footer():
-    text = Text("Press Ctrl+C to exit", style="dim")
-    return Panel(Align.center(text), box=box.SIMPLE)
-
-# ---------------------------------------------------------------------
-# Loop de Paper Trading com Dashboard
+# Loop de Paper Trading com prints
 # ---------------------------------------------------------------------
 def run_paper_trading(model, scaler, features):
     global USD_BALANCE, POSITION
+
     last_retrain = time.time()
-    layout = make_layout()
-    with Live(layout, refresh_per_second=1, screen=True):
-        while True:
-            try:
-                # Re-treina diariamente
-                if time.time() - last_retrain > RETRAIN_INTERVAL:
-                    console.log(f"[Bot] Re-treinando modelo às {datetime.utcnow()} UTC...")
-                    df_hist = fetch_klines(SYMBOL, TIMEFRAMES[1])
-                    df_feat = label_data(build_features(df_hist))
-                    model, scaler, features = train_model(df_feat)
-                    last_retrain = time.time()
+    print("[Bot] Iniciando paper trading...")
+    while True:
+        try:
+            # Re-treina diariamente
+            if time.time() - last_retrain > RETRAIN_INTERVAL:
+                print(f"[Bot] Re-treinando modelo às {datetime.utcnow()} UTC...")
+                df_hist = fetch_klines(SYMBOL, TIMEFRAMES[1])
+                df_feat = label_data(build_features(df_hist))
+                model, scaler, features = train_model(df_feat)
+                last_retrain = time.time()
 
-                # Coleta último candle
-                klines = client.get_klines(symbol=SYMBOL, interval=TIMEFRAMES[0], limit=FEATURE_WINDOW+1)
-                df_live= pd.DataFrame(klines, columns=[
-                    "open_time","open","high","low","close","volume","close_time",
-                    "qav","num_trades","tb","tq","ignore"
-                ])
-                df_live[['open','high','low','close','volume']] = \
-                    df_live[['open','high','low','close','volume']].astype(float)
-                df_live['dt'] = pd.to_datetime(df_live['open_time'], unit='ms')
-                df_live.set_index('dt', inplace=True)
-                df_feat = build_features(df_live)
+            # Coleta último candle
+            klines = client.get_klines(symbol=SYMBOL, interval=TIMEFRAMES[0], limit=FEATURE_WINDOW+1)
+            df_live= pd.DataFrame(klines, columns=[
+                "open_time","open","high","low","close","volume","close_time",
+                "qav","num_trades","tb","tq","ignore"
+            ])
+            df_live[['open','high','low','close','volume']] = \
+                df_live[['open','high','low','close','volume']].astype(float)
+            df_live['dt'] = pd.to_datetime(df_live['open_time'], unit='ms')
+            df_live.set_index('dt', inplace=True)
+            df_feat = build_features(df_live)
 
-                # Previsão
-                window    = scaler.transform(df_feat[features].values)[-FEATURE_WINDOW:]
-                p         = model.predict(window[np.newaxis,:,:], verbose=0)[0,0]
-                price     = df_feat['close'].iloc[-1]
-                sentiment = df_feat['sentiment'].iloc[-1]
-                stress    = df_feat['vol'].iloc[-1] * 100
-                ema_ok    = df_feat['close'].iloc[-1] > df_feat['ema_20'].iloc[-1]
-                rsi_ok    = df_feat['rsi14'].iloc[-1] < 70
+            # Previsão e indicadores
+            window    = scaler.transform(df_feat[features].values)[-FEATURE_WINDOW:]
+            p         = model.predict(window[np.newaxis,:,:], verbose=0)[0,0]
+            price     = df_feat['close'].iloc[-1]
+            sentiment = df_feat['sentiment'].iloc[-1]
+            stress    = df_feat['vol'].iloc[-1] * 100
+            ema_ok    = df_feat['close'].iloc[-1] > df_feat['ema_20'].iloc[-1]
+            rsi_ok    = df_feat['rsi14'].iloc[-1] < 70
 
-                action, pl = "-", ""
-                qty = 0.0
-                if p > 0.8 and ema_ok and rsi_ok and USD_BALANCE > 0:
-                    qty = (USD_BALANCE * min(p, 0.5)) / price
-                    USD_BALANCE -= qty * price
-                    POSITION     += qty
-                    action = "BUY"
-                    trade_log.append((
-                        datetime.utcnow().strftime("%H:%M:%S"),
-                        action,
-                        f"{qty:.5f}",
-                        f"{price:.2f}",
-                        ""
-                    ))
-                elif p < 0.2 and POSITION > 0:
-                    USD_BALANCE += POSITION * price
-                    action = "SELL"
-                    entry_price = float(trade_log[-1][3]) if trade_log else price
-                    pl = f"{((price / entry_price - 1)*100):.2f}%"
-                    trade_log.append((
-                        datetime.utcnow().strftime("%H:%M:%S"),
-                        action,
-                        f"{POSITION:.5f}",
-                        f"{price:.2f}",
-                        pl
-                    ))
-                    POSITION = 0
+            # Print dos indicadores
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            print("\n[Bot]", now)
+            print(f"Signal:     {p*100:5.1f}%")
+            print(f"Sentiment:  {sentiment:5.1f}%")
+            print(f"Stress:     {stress:5.1f}%")
+            print(f"EMA OK:     {ema_ok}")
+            print(f"RSI OK:     {rsi_ok}")
 
-                # Atualiza dashboard
-                layout["header"].update(render_header())
-                layout["metrics"].update(render_metrics(
-                    p, sentiment, stress, ema_ok, rsi_ok, USD_BALANCE, POSITION, price
-                ))
-                layout["trades"].update(render_trades())
-                layout["footer"].update(render_footer())
+            # Decisão de compra/venda
+            action = "HOLD"
+            if p > 0.8 and ema_ok and rsi_ok and USD_BALANCE > 0:
+                qty = (USD_BALANCE * min(p, 0.5)) / price
+                USD_BALANCE -= qty * price
+                POSITION     += qty
+                action = f"BUY  {qty:.5f} BTC @ {price:.2f}"
+                trade_log.append((now, "BUY", f"{qty:.5f}", f"{price:.2f}", ""))
+            elif p < 0.2 and POSITION > 0:
+                USD_BALANCE += POSITION * price
+                entry_price = float(trade_log[-1][3]) if trade_log else price
+                pl = f"{((price / entry_price - 1)*100):.2f}%"
+                action = f"SELL {POSITION:.5f} BTC @ {price:.2f} (P/L {pl})"
+                trade_log.append((now, "SELL", f"{POSITION:.5f}", f"{price:.2f}", pl))
+                POSITION = 0
+            print("Action:     ", action)
 
-                time.sleep(60)
-            except KeyboardInterrupt:
-                console.log("Encerrando...")
-                break
-            except Exception as e:
-                console.log("[Erro]", e)
-                time.sleep(5)
+            # Saldo e PnL
+            total = USD_BALANCE + POSITION * price
+            pnl   = (total - INITIAL_USD) / INITIAL_USD * 100
+            print(f"USD Bal:    {USD_BALANCE:8.2f}")
+            print(f"BTC Pos:    {POSITION:8.5f}")
+            print(f"Total Val:  {total:8.2f} (PnL {pnl:6.2f}%)")
+
+            # Exibe últimos trades
+            print("Recent Trades:")
+            for t in trade_log:
+                print(" ", *t)
+
+            time.sleep(60)
+
+        except KeyboardInterrupt:
+            print("Encerrando...")
+            break
+        except BinanceAPIException as e:
+            print("[Erro BinanceAPI]", e)
+            time.sleep(5)
+        except Exception as e:
+            print("[Erro geral]", e)
+            time.sleep(5)
 
 # ---------------------------------------------------------------------
 # Fluxo Principal
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    console.log("📈 Preparando dados e modelo...")
+    print("📈 Preparando dados e modelo...")
     df_hist = fetch_klines(SYMBOL, TIMEFRAMES[1], lookback_days=365)
     df_feat = label_data(build_features(df_hist))
     model, scaler, features = train_model(df_feat)
